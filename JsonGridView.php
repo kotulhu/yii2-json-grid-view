@@ -1,10 +1,52 @@
 <?php
+
 namespace app\widgets;
 
 use yii\base\Widget;
+use yii\helpers\Html;
 use yii\helpers\Json;
 use yii\helpers\Url;
+use yii\widgets\ActiveForm;
 
+/**
+ * Example
+ *
+ * --- Action ---
+ *
+ * public function actionCreate()
+ * {
+ *     $model = new model();
+ *     $model->load(Yii::$app->request->post());
+ *
+ *     if ($model->validate()) {
+ *         $model->save();
+ *         return $this->asJson(['success' => true, 'id' => $model->id]);
+ *     }
+ *
+ *     return $this->asJson([
+ *         'success' => false,
+ *         'errors' => \yii\widgets\ActiveForm::validate($model),
+ *     ]);
+ * }
+ *
+ * --- view ---
+ *
+ * echo JsonGridView::widget([
+ *     'url' => ['/controller/view'],
+ *     'columns' => [
+ *         ['attribute' => 'name', 'label' => 'Name'],
+ *         ['attribute' => 'value', 'label' => 'Value'],
+ *     ],
+ *     'createModel' => new model(),
+ *     'createUrl' => ['/controller/create'],
+ *     'createFields' => [
+ *         'name',
+ *         'percent',
+ *         ['attribute' => 'is_active', 'type' => 'checkbox'],
+ *         ['attribute' => 'type', 'type' => 'dropDownList', 'items' => model::getTypeList()],
+ *     ],
+ * ]);
+ */
 class JsonGridView extends Widget
 {
     public $containerId = 'json-grid';
@@ -17,14 +59,127 @@ class JsonGridView extends Widget
     public $registerCss = true;
     public $keyAttribute = 'id';
     public $onAfterRender = null; // Колбек, вызываемый после отрисовки
-    public $searchFields = []; // массив полей для формы поиска
+    public $searchFields = []; // массив полей для формы поиска; необязательный ключ 'order' задаёт порядок отображения (меньше — раньше)
+    public $syncUrl = true; // false — не хранить page/sort/filters в query string
+
+    // --- Форма добавления записи ---
+    public $createModel = null;        // экземпляр модели (new Model()), используется для rules()/attributeLabels()
+    public $createUrl = null;          // экшен, куда постится форма (например ['/controller/create'])
+    public $createFields = [];         // список полей: ['attr1', 'attr2'] либо ['attribute'=>'attr','type'=>'dropDownList',...]
+    public $createButtonLabel = 'Додати';
+    public $createModalTitle = 'Додати запис';
+    public $customHtml = null;
+
+    // --- Alertigo (уведомления об ошибках) ---
+    public $alertigoCssPath = 'css/alertigo/jquery-alertigo.css'; // относительно @webroot
+    public $alertigoJsPath = 'js/alertigo/jquery-alertigo.js';    // относительно @webroot
+    private $_alertigoAvailable = null; // кэш результата проверки наличия библиотеки
+
+    // Список attribute, разрешённых для сортировки — берётся из тех же columns, что и в виджете
+    public static function getSortableAttributes(array $columns): array
+    {
+        $result = [];
+        foreach ($columns as $col) {
+            if (!empty($col['attribute']) && ($col['sortable'] ?? true) !== false) {
+                $result[] = $col['attribute'];
+            }
+        }
+        return $result;
+    }
+
+    // Безопасно разбирает sort/dir из запроса: значение вне белого списка отбрасывается в $default
+    // (защита от SQL-инъекции через имя колонки в ORDER BY)
+    public static function resolveSort(array $params, array $allowedAttributes, ?array $default = null): array
+    {
+        $default = $default ?? ['attribute' => null, 'direction' => 'desc'];
+        $attribute = $params['sort'] ?? null;
+        $direction = ($params['dir'] ?? null) === 'asc' ? 'asc' : 'desc';
+
+        if ($attribute !== null && in_array($attribute, $allowedAttributes, true)) {
+            return ['attribute' => $attribute, 'direction' => $direction];
+        }
+        return $default;
+    }
+
+    // Зажимает pageSize сверху, чтобы клиент не запросил count=100000 и не положил БД
+    public static function clampPageSize($count, int $max = 200, int $default = 20): int
+    {
+        $count = (int)$count;
+        return $count > 0 ? min($count, $max) : $default;
+    }
 
     public function run()
     {
         $this->registerAssets();
+        $createHtml = $this->renderCreateModal();
         $formHtml = $this->renderSearchForm();
         $containerHtml = "<div id=\"{$this->containerId}\"></div>";
-        return $formHtml . $containerHtml;
+        $customHtml = $this->customHtml;
+        $alertigoHtml = $this->isAlertigoAvailable() ? '<div id="alertigo"></div>' : '';
+        return $alertigoHtml . $createHtml . $formHtml . $customHtml . $containerHtml;
+    }
+
+    /**
+     * Проверяет физическое наличие файлов библиотеки alertigo в @webroot.
+     * Результат кэшируется на время запроса.
+     */
+    protected function isAlertigoAvailable()
+    {
+        if ($this->_alertigoAvailable === null) {
+            $webroot = \Yii::getAlias('@webroot');
+            $this->_alertigoAvailable = is_file($webroot . '/' . ltrim($this->alertigoCssPath, '/'))
+                && is_file($webroot . '/' . ltrim($this->alertigoJsPath, '/'));
+        }
+        return $this->_alertigoAvailable;
+    }
+
+    /**
+     * Регистрирует ассеты alertigo, если библиотека физически присутствует в проекте.
+     * Если её нет — ничего не делает, и клиентский JS сам fallback'нется на alert().
+     */
+    protected function registerAlertigoAssets()
+    {
+        if (!$this->isAlertigoAvailable()) {
+            return;
+        }
+        $view = $this->getView();
+        $view->registerCssFile(\Yii::$app->homeUrl . $this->alertigoCssPath);
+        $view->registerJsFile(\Yii::$app->homeUrl . $this->alertigoJsPath, ['position' => \yii\web\View::POS_BEGIN]);
+    }
+
+    /**
+     * Сортирует поля поиска по необязательному ключу 'order' (число, меньше — раньше).
+     * Поля без 'order' сохраняют исходный взаимный порядок и располагаются после
+     * полей, у которых 'order' указан явно (сортировка устойчивая).
+     *
+     * Пример:
+     *   'searchFields' => [
+     *       ['attribute' => 'name', 'order' => 20],
+     *       ['attribute' => 'status', 'order' => 10],
+     *       ['attribute' => 'created_at'], // order не задан — уйдёт в конец
+     *   ]
+     */
+    protected function sortSearchFields(array $fields)
+    {
+        $indexed = [];
+        foreach (array_values($fields) as $i => $field) {
+            $order = is_array($field) && isset($field['order']) ? (float)$field['order'] : null;
+            $indexed[] = ['field' => $field, 'order' => $order, 'i' => $i];
+        }
+
+        usort($indexed, function ($a, $b) {
+            // поля без order считаем бесконечно большими, чтобы они шли после упорядоченных
+            $orderA = $a['order'] === null ? PHP_FLOAT_MAX : $a['order'];
+            $orderB = $b['order'] === null ? PHP_FLOAT_MAX : $b['order'];
+            if ($orderA === $orderB) {
+                return $a['i'] <=> $b['i'];
+            }
+            return $orderA <=> $orderB;
+        });
+
+        return array_map(function ($item) {
+            return $item['field'];
+        }, $indexed);
     }
 
     protected function renderSearchForm()
@@ -40,11 +195,13 @@ class JsonGridView extends Widget
         $html .= '<input type="hidden" name="_csrf" value="' . \Yii::$app->request->csrfToken . '">';
 
         $html .= '<div class="flex-row">';
-        // Разбиваем поля по двум колонкам (как в примере) – можно кастомизировать
+
+        $fields = $this->sortSearchFields($this->searchFields);
+
         $firstCol = '';
         $secondCol = '';
         $i = 0;
-        foreach ($this->searchFields as $field) {
+        foreach ($fields as $field) {
             $fieldHtml = $this->renderField($field);
             if ($i % 2 == 0) {
                 $firstCol .= '<div class="flex-item">' . $fieldHtml . '</div>';
@@ -59,24 +216,146 @@ class JsonGridView extends Widget
 
         $html .= '<br><div class="pull-left">';
         // Можно добавить дополнительные кнопки (например, SendPulse)
-        $html .= '</div><div class="pull-right">';
-        $html .= '<a class="btn btn-danger z_button_search_button search-reset" href="#"><i class="fa fa-eraser"></i> Очистить</a>';
+        $html .= '</div><div class="pull-right btn-blc">';
+        $html .= '<a class="btn btn-danger z_button_search_button search-reset" href="#"><i class="fa fa-eraser"></i> Очистити</a>';
         $html .= '<button type="button" class="btn btn-success z_button z_button_search_button search-submit"><i class="fa fa-search"></i> Показати</button>';
         $html .= '</div></form></div>';
 
         return $html;
     }
 
+    /**
+     *  Render add button using $this->createModel and $this->createFields. Labels & rules (client-side also) are from model.
+     *  $createFields can be:
+     *  'attribute_name'
+     *  text input
+     *  ['attribute' => 'status', 'type' => 'dropDownList', 'items' => [...]]
+     *  ['attribute' => 'comment', 'type' => 'textarea']
+     *  ['attribute' => 'password', 'type' => 'textInput', 'htmlType' => 'password']
+     *  ['attribute' => 'active', 'type' => 'checkbox']
+     *  ['attribute' => 'user_id', 'type' => 'widget', 'widgetClass' => ..., 'widgetOptions' => [...]]
+     */
+    protected function renderCreateModal()
+    {
+        if (!$this->createModel || !$this->createUrl) {
+            return '';
+        }
+
+        $modalId = $this->containerId . '-create-modal';
+        $formId = $this->containerId . '-create-form';
+
+        ob_start();
+        $form = ActiveForm::begin([
+            'id' => $formId,
+            'action' => Url::to($this->createUrl),
+            'options' => ['class' => 'json-grid-create-form'],
+            'enableClientValidation' => true,
+            'enableAjaxValidation' => false,
+        ]);
+
+        foreach ($this->createFields as $field) {
+            if (is_string($field)) {
+                $field = ['attribute' => $field];
+            }
+            $attribute = $field['attribute'];
+            $type = $field['type'] ?? 'textInput';
+            $activeField = $form->field($this->createModel, $attribute, $field['fieldOptions'] ?? []);
+
+            switch ($type) {
+                case 'dropDownList':
+                    echo $activeField->dropDownList($field['items'] ?? [], $field['inputOptions'] ?? []);
+                    break;
+                case 'textarea':
+                    echo $activeField->textarea($field['inputOptions'] ?? []);
+                    break;
+                case 'checkbox':
+                    echo $activeField->checkbox($field['inputOptions'] ?? []);
+                    break;
+                case 'widget':
+                    echo $activeField->widget($field['widgetClass'], $field['widgetOptions'] ?? []);
+                    break;
+                default:
+                    $inputOptions = $field['inputOptions'] ?? [];
+                    if (!empty($field['htmlType'])) {
+                        $inputOptions['type'] = $field['htmlType'];
+                    }
+                    echo $activeField->textInput($inputOptions);
+            }
+        }
+
+        echo Html::submitButton('Зберегти', ['class' => 'btn btn-success']);
+        echo ' ';
+        echo Html::button('Скасувати', ['class' => 'btn btn-default json-grid-create-cancel']);
+        ActiveForm::end();
+        $formContent = ob_get_clean();
+
+        $html = '<div class="json-grid-create-block">';
+        $html .= Html::button($this->createButtonLabel, [
+            'class' => 'btn btn-success json-grid-create-open',
+            'data-modal' => $modalId,
+        ]);
+
+        $html .= '<div id="' . $modalId . '" class="json-grid-modal" style="display:none;">';
+        $html .= '<div class="json-grid-modal-backdrop"></div>';
+        $html .= '<div class="json-grid-modal-dialog">';
+        $html .= '<div class="json-grid-modal-header">';
+        $html .= '<span>' . Html::encode($this->createModalTitle) . '</span>';
+        $html .= '<a href="#" class="json-grid-modal-close">&times;</a>';
+        $html .= '</div>';
+        $html .= '<div class="json-grid-modal-body">' . $formContent . '</div>';
+        $html .= '</div></div></div>';
+
+        return $html;
+    }
+
+    /**
+     * Приводит style к строке для атрибута HTML.
+     * Принимает либо готовую строку ("color:red;font-weight:bold;"),
+     * либо массив ['color' => 'red', 'font-weight' => 'bold'].
+     */
+    protected function normalizeStyle($style)
+    {
+        if (is_array($style)) {
+            $parts = [];
+            foreach ($style as $prop => $val) {
+                $parts[] = $prop . ':' . $val;
+            }
+            return Html::encode(implode(';', $parts));
+        }
+        return Html::encode((string)$style);
+    }
+
     protected function renderField($field)
     {
+        $type = $field['type'] ?? 'text'; // text, select, widget, html
+
+        // 1. Поле полностью произвольного рендеринга — колбэк вернёт готовый HTML.
+        //    Позволяет встроить что угодно, не ограничиваясь предопределёнными типами.
+        if (isset($field['render']) && is_callable($field['render'])) {
+            return call_user_func($field['render'], $field, $this);
+        }
+
+        // 2. Готовый заранее сформированный HTML-блок.
+        if ($type === 'html') {
+            return $field['html'] ?? '';
+        }
+
+        // 3. Встраивание произвольного Yii-виджета (например, автокомплит юзера/банка).
+        if ($type === 'widget') {
+            return $this->renderWidgetField($field);
+        }
+
         $name = $field['name'] ?? '';
         $label = $field['label'] ?? '';
-        $type = $field['type'] ?? 'text'; // text, select
         $options = $field['options'] ?? [];
         $placeholder = $field['placeholder'] ?? '';
         $value = $field['value'] ?? '';
         $class = $field['class'] ?? 'z_input_text';
         $id = $field['id'] ?? '';
+        $disabled = $field['disabled'] ?? false;
+        $style = $field['style'] ?? ''; // строка "color:red;" или массив ['color' => 'red']
+        $extraAttrs = $field['attrs'] ?? []; // любые прочие HTML-атрибуты: ['data-foo' => 'bar', 'readonly' => true]
+        $required = $field['required'] ?? false;
 
         $attrs = '';
         if ($id) $attrs .= ' id="' . $id . '"';
@@ -84,8 +363,25 @@ class JsonGridView extends Widget
         $attrs .= ' name="' . $name . '"';
         if ($placeholder) $attrs .= ' placeholder="' . $placeholder . '"';
         if ($value) $attrs .= ' value="' . $value . '"';
+        if ($disabled) $attrs .= ' disabled';
+        if ($required) $attrs .= ' required';
+        if ($style) $attrs .= ' style="' . $this->normalizeStyle($style) . '"';
+        foreach ($extraAttrs as $attrName => $attrVal) {
+            if ($attrVal === true) {
+                $attrs .= ' ' . Html::encode($attrName);
+            } elseif ($attrVal !== false && $attrVal !== null) {
+                $attrs .= ' ' . Html::encode($attrName) . '="' . Html::encode($attrVal) . '"';
+            }
+        }
 
-        $html = '<div class="form-group z_float_tab">';
+        // Обёртка поля тоже может получить свой класс/стиль (например, чтобы прятать всю группу целиком)
+        $wrapClass = 'form-group z_float_tab';
+        if (!empty($field['wrapClass'])) $wrapClass .= ' ' . $field['wrapClass'];
+        $wrapStyle = $field['wrapStyle'] ?? '';
+        $wrapAttrs = ' class="' . $wrapClass . '"';
+        if ($wrapStyle) $wrapAttrs .= ' style="' . $this->normalizeStyle($wrapStyle) . '"';
+
+        $html = '<div' . $wrapAttrs . '>';
         if ($type === 'select') {
             $html .= '<select ' . $attrs . '>';
             if ($placeholder) $html .= '<option value="">' . $placeholder . '</option>';
@@ -105,28 +401,114 @@ class JsonGridView extends Widget
         return $html;
     }
 
+    /**
+     * Рендерит произвольный Yii-виджет как поле фильтра.
+     *
+     * Конфиг поля:
+     * [
+     *     'type' => 'widget',
+     *     'name' => 'user_id',          // имя поля, попадёт в filters при сабмите
+     *     'value' => '',                 // текущее значение (id)
+     *     'label' => 'Пользователь',
+     *     'id' => 'user-filter',         // необязательно, id корневого элемента виджета
+     *     'widgetClass' => \app\widgets\WidgetUserAutocomplete::class,
+     *     'widgetOptions' => [           // любые публичные свойства виджета
+     *         'searchUrl' => '/b2/user/autocomplete',
+     *         'labelValue' => '...',
+     *         'onSelect' => 'myCallback',
+     *     ],
+     *     'wrap' => true,                // false — не оборачивать в .form-group/label
+     * ]
+     */
+    protected function renderWidgetField($field)
+    {
+        $widgetClass = $field['widgetClass'] ?? null;
+        $widgetOptions = $field['widgetOptions'] ?? [];
+        $label = $field['label'] ?? '';
+        $wrap = $field['wrap'] ?? true;
+
+        if (!$widgetClass || !class_exists($widgetClass)) {
+            return '<!-- JsonGridView: widget class "' . Html::encode((string)$widgetClass) . '" not found -->';
+        }
+
+        // Подставляем name/value/id из настроек поля, если они явно не заданы в widgetOptions,
+        // чтобы не дублировать их в конфиге каждый раз.
+        if (!isset($widgetOptions['name']) && isset($field['name'])) {
+            $widgetOptions['name'] = $field['name'];
+        }
+        if (!isset($widgetOptions['value']) && array_key_exists('value', $field)) {
+            $widgetOptions['value'] = $field['value'];
+        }
+        if (isset($field['id']) && !isset($widgetOptions['options']['id'])) {
+            $widgetOptions['options']['id'] = $field['id'];
+        }
+        // Пробрасываем disabled в сам виджет, если он его поддерживает (проверяется через свойство класса)
+        if (isset($field['disabled']) && property_exists($widgetClass, 'disabled')) {
+            $widgetOptions['disabled'] = $field['disabled'];
+        }
+
+        $widgetHtml = call_user_func([$widgetClass, 'widget'], $widgetOptions);
+
+        if (!$wrap) {
+            return $widgetHtml;
+        }
+
+        $wrapClass = 'form-group z_float_tab';
+        if (!empty($field['wrapClass'])) $wrapClass .= ' ' . $field['wrapClass'];
+        $wrapStyle = $field['wrapStyle'] ?? '';
+        $wrapAttrs = ' class="' . $wrapClass . '"';
+        if ($wrapStyle) $wrapAttrs .= ' style="' . $this->normalizeStyle($wrapStyle) . '"';
+
+        $html = '<div' . $wrapAttrs . '>';
+        $html .= $widgetHtml;
+        if ($label) {
+            $html .= '<label class="z_float_app">' . Html::encode($label) . '</label>';
+        }
+        $html .= '<div class="help-block"></div>';
+        $html .= '</div>';
+
+        return $html;
+    }
+
     protected function registerAssets()
     {
         $view = $this->getView();
 
+        $this->registerAlertigoAssets();
+
         if ($this->registerCss) {
             /*$css = <<<CSS
-.json-grid-table { border-collapse: collapse; width: 100%; }
-.json-grid-table th, .json-grid-table td { border: 1px solid #ddd; padding: 8px; }
-.json-grid-table th { background: #f4f4f4; cursor: pointer; user-select: none; }
-.json-grid-table th.sorted { background: #e0e0e0; }
-.json-grid-pagination { margin-top: 15px; }
-.json-grid-pagination ul.pagination { display: flex; list-style: none; padding: 0; gap: 5px; margin: 0; flex-wrap: wrap; }
-.json-grid-pagination ul.pagination li { display: inline; }
-.json-grid-pagination ul.pagination li a { display: block; padding: 5px 12px; border: 1px solid #ddd; text-decoration: none; color: #007bff; border-radius: 3px; }
-.json-grid-pagination ul.pagination li.active a { background: #007bff; color: white; border-color: #007bff; }
-.json-grid-pagination ul.pagination li.disabled a { color: #ccc; pointer-events: none; background: #f9f9f9; }
-.json-grid-pagination ul.pagination li a:hover:not(.disabled) { background: #f0f0f0; }
-.json-grid-pagination .pagination-info { margin-left: 10px; font-size: 14px; color: #555; display: inline-block; }
-.grid-loader { padding: 10px; color: #007bff; font-weight: bold; }
-.grid-error { padding: 10px; color: #d9534f; background: #f2dede; border: 1px solid #ebccd1; border-radius: 4px; }
-CSS;
+            .json-grid-table { border-collapse: collapse; width: 100%; }
+            .json-grid-table th, .json-grid-table td { border: 1px solid #ddd; padding: 8px; }
+            .json-grid-table th { background: #f4f4f4; cursor: pointer; user-select: none; }
+            .json-grid-table th.sorted { background: #e0e0e0; }
+            .json-grid-pagination { margin-top: 15px; }
+            .json-grid-pagination ul.pagination { display: flex; list-style: none; padding: 0; gap: 5px; margin: 0; flex-wrap: wrap; }
+            .json-grid-pagination ul.pagination li { display: inline; }
+            .json-grid-pagination ul.pagination li a { display: block; padding: 5px 12px; border: 1px solid #ddd; text-decoration: none; color: #007bff; border-radius: 3px; }
+            .json-grid-pagination ul.pagination li.active a { background: #007bff; color: white; border-color: #007bff; }
+            .json-grid-pagination ul.pagination li.disabled a { color: #ccc; pointer-events: none; background: #f9f9f9; }
+            .json-grid-pagination ul.pagination li a:hover:not(.disabled) { background: #f0f0f0; }
+            .json-grid-pagination .pagination-info { margin-left: 10px; font-size: 14px; color: #555; display: inline-block; }
+            .grid-loader { padding: 10px; color: #007bff; font-weight: bold; }
+            .grid-error { padding: 10px; color: #d9534f; background: #f2dede; border: 1px solid #ebccd1; border-radius: 4px; }
+            CSS;
             $view->registerCss($css);*/
+
+            $css = <<<CSS
+            #{$this->containerId}-search-form .btn-blc {
+               display: flex;
+               gap: 10px;
+            }
+            #{$this->containerId}-search-form .z_button_search_button {
+                width:auto;
+            }
+            .json-grid-pagination {
+                display: flex;
+                flex-direction: column;
+            }
+            CSS;
+            $view->registerCss($css);
 
             // loading animation
             $css = <<<CSS
@@ -148,6 +530,18 @@ CSS;
         }
         CSS;
             $view->registerCss($css);
+
+            $css = <<<CSS
+            .json-grid-create-block { margin-bottom: 15px; }
+            .json-grid-modal { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1050; }
+            .json-grid-modal-backdrop { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }
+            .json-grid-modal-dialog { position: relative; background: #fff; width: 500px; max-width: 90%; margin: 60px auto; border-radius: 4px; box-shadow: 0 5px 20px rgba(0,0,0,0.3); max-height: 80vh; display: flex; flex-direction: column; }
+            .json-grid-modal-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-bottom: 1px solid #eee; }
+            .json-grid-modal-header span { font-weight: bold; }
+            .json-grid-modal-close { text-decoration: none; font-size: 20px; color: #888; }
+            .json-grid-modal-body { padding: 16px; overflow-y: auto; }
+            CSS;
+            $view->registerCss($css);
         }
 
         $options = [
@@ -160,12 +554,73 @@ CSS;
             'paginationType' => $this->paginationType,
             'keyAttribute' => $this->keyAttribute,
             'onAfterRender' => $this->onAfterRender,
+            'syncUrl' => $this->syncUrl,
         ];
         $jsonOptions = Json::encode($options);
 
         $jsCode = $this->getJsCode();
         $view->registerJs($jsCode, \yii\web\View::POS_HEAD);
-        $view->registerJs("$(function() { new JsonGridView({$jsonOptions}); });");
+        $instanceVar = 'jsonGridInstance_' . preg_replace('/[^a-zA-Z0-9_]/', '_', $this->containerId);
+        $view->registerJs("$(function() { window['{$instanceVar}'] = new JsonGridView({$jsonOptions}); });");
+
+        if ($this->createModel && $this->createUrl) {
+            $this->registerCreateModalJs($instanceVar);
+        }
+    }
+
+    /**
+     * JS для открытия/закрытия модалки и ajax-сабмита формы добавления записи.
+     * Ошибки валидации с сервера ожидаются в формате yii\widgets\ActiveForm::validate($model),
+     * т.е. массив ["ModelName-attribute" => ["текст ошибки", ...]].
+     */
+    protected function registerCreateModalJs($instanceVar)
+    {
+        $view = $this->getView();
+        $containerId = $this->containerId;
+        $modalId = $containerId . '-create-modal';
+        $formId = $containerId . '-create-form';
+
+        $js = <<<JS
+(function() {
+    var \$modal = $('#{$modalId}');
+    var \$form = $('#{$formId}');
+
+    $(document).on('click', '[data-modal="{$modalId}"]', function(e) {
+        e.preventDefault();
+        \$modal.show();
+    });
+
+    function closeModal() {
+        \$modal.hide();
+        \$form[0].reset();
+        \$form.find('.help-block').text('');
+        \$form.find('.has-error').removeClass('has-error');
+    }
+
+    \$modal.find('.json-grid-modal-close, .json-grid-create-cancel, .json-grid-modal-backdrop').on('click', function(e) {
+        e.preventDefault();
+        closeModal();
+    });
+
+    \$form.on('beforeSubmit', function(e) {
+        var form = $(this);
+        $.post(form.attr('action'), form.serialize(), function(data) {
+            if (data && data.success) {
+                closeModal();
+                if (window['{$instanceVar}']) {
+                    window['{$instanceVar}'].refresh();
+                }
+            } else if (data && data.errors) {
+                form.yiiActiveForm('updateAjaxErrors', data.errors);
+            }
+        }, 'json').fail(function() {
+            jsonGridAlert('Помилка збереження запису');
+        });
+        return false;
+    });
+})();
+JS;
+        $view->registerJs($js);
     }
 
     protected function prepareColumns()
@@ -189,6 +644,14 @@ CSS;
     protected function getJsCode()
     {
         return <<<'JS'
+function jsonGridAlert(message, options) {
+    if (window.alertigo) {
+        alertigo(message || 'Помилка запиту', $.extend({ color: 'red', life: '5000' }, options || {}));
+    } else {
+        alert(message || 'Помилка запиту');
+    }
+}
+
 class JsonGridView {
     constructor(options) {
         this.container = $(options.container);
@@ -204,6 +667,7 @@ class JsonGridView {
         this.paginationType = options.paginationType || 'buttons';
         this.keyAttribute = options.keyAttribute || 'id';
         this.onAfterRender = options.onAfterRender || null;
+        this.syncUrl = options.syncUrl !== undefined ? options.syncUrl : true;
 
         this.state = {
             page: 1,
@@ -226,12 +690,21 @@ class JsonGridView {
     }
 
     restoreFromUrl() {
+        if (!this.syncUrl) return; // не читаем url
+    
         var params = new URLSearchParams(window.location.search);
         var page = parseInt(params.get('page'));
         if (page > 0) this.state.page = page;
         var sortAttr = params.get('sort');
         var sortDir = params.get('dir');
-        if (sortAttr && (sortDir === 'asc' || sortDir === 'desc')) {
+        // sort приходит из URL, который пользователь может отредактировать руками —
+        // пускаем только «похожее на имя поля» (буквы/цифры/подчёркивание) и только
+        // то, что реально объявлено в columns этого виджета
+        var isValidFieldName = sortAttr && /^[a-zA-Z0-9_]+$/.test(sortAttr);
+        var isKnownColumn = isValidFieldName && this.columns.some(function(col) {
+            return col.attribute === sortAttr;
+        });
+        if (isKnownColumn && (sortDir === 'asc' || sortDir === 'desc')) {
             this.state.sort = { attribute: sortAttr, direction: sortDir };
         }
         var filtersParam = params.get('filters');
@@ -241,8 +714,10 @@ class JsonGridView {
             } catch(e) {}
         }
     }
-
+    
     updateUrl() {
+        if (!this.syncUrl) return; // не пишем в URL вовсе
+    
         var params = new URLSearchParams();
         params.set('page', this.state.page);
         params.set('count', this.state.pageSize);
@@ -284,6 +759,7 @@ class JsonGridView {
         }).fail(function(xhr, status, error) {
             console.error('Ошибка загрузки:', error);
             self.showError('Ошибка загрузки данных: ' + error);
+            jsonGridAlert('Помилка завантаження даних: ' + error);
             self.loading = false;
             self.hideLoading();
         });
@@ -456,24 +932,23 @@ class JsonGridView {
         });
 
         $(window).on('popstate', function(event) {
+            if (!self.syncUrl) return;
             if (event.originalEvent.state && event.originalEvent.state.state) {
                 self.state = event.originalEvent.state.state;
                 self.loadData();
             }
         });
         
-        // Обработка кнопки "Показати" (класс search-submit)
         this.container.parent().on('click', '.search-submit', function(e) {
             e.preventDefault();
             self.collectFiltersFromForm();
             self.goToPage(1);
         });
-    
-        // Обработка кнопки "Очистить" (класс search-reset)
+        
         this.container.parent().on('click', '.search-reset', function(e) {
             e.preventDefault();
             var form = $(this).closest('form');
-            form.find('input, select').val(''); // сброс значений
+            form.find('input, select').val(''); // reset
             self.collectFiltersFromForm();
             self.goToPage(1);
         });
@@ -503,7 +978,11 @@ class JsonGridView {
     }
 
     goToPage(page) {
-        if (page < 1 || page > this.pages) return;
+        page = parseInt(page, 10);
+        if (isNaN(page) || page < 1) return; // не число / меньше первой страницы — игнорируем
+        if (this.pages > 0 && page > this.pages) {
+            page = this.pages; // страница за пределами известного диапазона — зажимаем к последней
+        }
         this.state.page = page;
         this.updateUrl();
         this.loadData();
@@ -514,21 +993,17 @@ class JsonGridView {
     }
 
     showLoading() {
-        // Если есть таблица – добавляем класс анимации к tbody
         var tbody = this.container.find('table tbody');
         if (tbody.length) {
             tbody.addClass('table-loading');
         } else {
-            // Если таблицы ещё нет (первая загрузка) – показываем индикатор
             if (!this.container.find('.grid-loader').length) {
-                this.container.prepend('<div class="grid-loader">Загрузка...</div>');
+                this.container.prepend('<div class="grid-loader">Завантаження...</div>');
             }
         }
     }
     hideLoading() {
-        // Убираем класс анимации (если есть)
         this.container.find('table tbody').removeClass('table-loading');
-        // Убираем текстовый индикатор
         this.container.find('.grid-loader').remove();
     }
     showError(msg) {
