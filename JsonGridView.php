@@ -1,5 +1,4 @@
 <?php
-
 namespace app\widgets;
 
 use yii\base\Widget;
@@ -75,7 +74,7 @@ class JsonGridView extends Widget
     public $alertigoJsPath = 'js/alertigo/jquery-alertigo.js';    // относительно @webroot
     private $_alertigoAvailable = null; // кэш результата проверки наличия библиотеки
 
-    // Список attribute, разрешённых для сортировки — берётся из тех же columns, что и в виджете
+    // Список attribute, разрешённых для сортировки из тех же columns, что и в виджете
     public static function getSortableAttributes(array $columns): array
     {
         $result = [];
@@ -87,8 +86,6 @@ class JsonGridView extends Widget
         return $result;
     }
 
-    // Безопасно разбирает sort/dir из запроса: значение вне белого списка отбрасывается в $default
-    // (защита от SQL-инъекции через имя колонки в ORDER BY)
     public static function resolveSort(array $params, array $allowedAttributes, ?array $default = null): array
     {
         $default = $default ?? ['attribute' => null, 'direction' => 'desc'];
@@ -101,7 +98,6 @@ class JsonGridView extends Widget
         return $default;
     }
 
-    // Зажимает pageSize сверху, чтобы клиент не запросил count=100000 и не положил БД
     public static function clampPageSize($count, int $max = 200, int $default = 20): int
     {
         $count = (int)$count;
@@ -540,6 +536,7 @@ class JsonGridView extends Widget
             .json-grid-modal-header span { font-weight: bold; }
             .json-grid-modal-close { text-decoration: none; font-size: 20px; color: #888; }
             .json-grid-modal-body { padding: 16px; overflow-y: auto; }
+            .empty-row td { display: block !important; }
             CSS;
             $view->registerCss($css);
         }
@@ -697,8 +694,8 @@ class JsonGridView {
         if (page > 0) this.state.page = page;
         var sortAttr = params.get('sort');
         var sortDir = params.get('dir');
-        // sort приходит из URL, который пользователь может отредактировать руками —
-        // пускаем только «похожее на имя поля» (буквы/цифры/подчёркивание) и только
+        // sort из URL, который пользователь может отредактировать руками
+        // пускаем только «похожее на имя поля и только
         // то, что реально объявлено в columns этого виджета
         var isValidFieldName = sortAttr && /^[a-zA-Z0-9_]+$/.test(sortAttr);
         var isKnownColumn = isValidFieldName && this.columns.some(function(col) {
@@ -813,7 +810,9 @@ class JsonGridView {
 
         var tbody = $('<tbody></tbody>');
         if (this.data.length === 0) {
-            var emptyRow = $('<tr><td colspan="' + this.columns.length + '">Нет данных</td></tr>');
+            var isEmpty = !this.state.filters || Object.keys(this.state.filters).length === 0;
+            var msg = isEmpty ? 'Немає даних' : 'Не знайдено';
+            var emptyRow = $('<tr class="empty-row"><td colspan="' + this.columns.length + '" class="text-center">' + msg + '</td></tr>');
             tbody.append(emptyRow);
         } else {
             $.each(this.data, function(idx, item) {
@@ -979,9 +978,9 @@ class JsonGridView {
 
     goToPage(page) {
         page = parseInt(page, 10);
-        if (isNaN(page) || page < 1) return; // не число / меньше первой страницы — игнорируем
+        if (isNaN(page) || page < 1) return; // не число / меньше первой страницы игнорируем
         if (this.pages > 0 && page > this.pages) {
-            page = this.pages; // страница за пределами известного диапазона — зажимаем к последней
+            page = this.pages; // страница за пределами известного диапазона зажимаем к последней
         }
         this.state.page = page;
         this.updateUrl();
@@ -996,12 +995,14 @@ class JsonGridView {
         var tbody = this.container.find('table tbody');
         if (tbody.length) {
             tbody.addClass('table-loading');
+            tbody.find('tr.empty-row').hide();
         } else {
             if (!this.container.find('.grid-loader').length) {
                 this.container.prepend('<div class="grid-loader">Завантаження...</div>');
             }
         }
     }
+    
     hideLoading() {
         this.container.find('table tbody').removeClass('table-loading');
         this.container.find('.grid-loader').remove();
